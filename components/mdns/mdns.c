@@ -60,6 +60,9 @@ mdns_server_t *_mdns_server = NULL;
 static mdns_host_item_t *_mdns_host_list = NULL;
 static mdns_host_item_t _mdns_self_host;
 
+static mdns_pending_packet_t *_pending_list_head = NULL;
+static mdns_pending_packet_t *_pending_list_tail = NULL;
+
 static const char *TAG = "mdns";
 
 static volatile TaskHandle_t _mdns_service_task_handle = NULL;
@@ -4968,20 +4971,74 @@ static mdns_tx_packet_t *_mdns_create_search_packet(mdns_search_once_t *search, 
     return packet;
 }
 
+static esp_err_t _mdns_search_pend_pcb(mdns_tx_packet_t *packet)
+{
+    mdns_pending_packet_t *pending_packet = (mdns_pending_packet_t *)malloc(sizeof(mdns_tx_packet_t));
+    if (!pending_packet) {
+        return ESP_ERR_NO_MEM;
+    }
+    pending_packet->packet = packet;
+    pending_packet->next = NULL;
+
+    if (_pending_list_tail != NULL) {
+        _pending_list_tail->next = pending_packet;
+    } else {
+        _pending_list_head = pending_packet;
+    }
+    _pending_list_tail = pending_packet;
+    return ESP_OK;
+}
+
 /**
  * @brief  Send search packet to particular interface
  */
 static void _mdns_search_send_pcb(mdns_search_once_t *search, mdns_if_t tcpip_if, mdns_ip_protocol_t ip_protocol)
 {
     mdns_tx_packet_t *packet = NULL;
+    packet = _mdns_create_search_packet(search, tcpip_if, ip_protocol);
+    if (!packet) {
+        return;
+    }
     if (mdns_is_netif_ready(tcpip_if, ip_protocol) && _mdns_server->interfaces[tcpip_if].pcbs[ip_protocol].state > PCB_INIT) {
-        packet = _mdns_create_search_packet(search, tcpip_if, ip_protocol);
-        if (!packet) {
-            return;
-        }
         _mdns_dispatch_tx_packet(packet);
         _mdns_free_tx_packet(packet);
+    } else if (_mdns_search_pend_pcb(packet) != ESP_OK) {
+        _mdns_free_tx_packet(packet);
     }
+}
+
+/**
+ * @brief  Send pending search packet to particular interface
+ */
+static void _mdns_search_send_pending_pcb(void)
+{
+    mdns_pending_packet_t *pending_packet = _pending_list_head;
+    mdns_pending_packet_t *tmp_head = NULL;
+    mdns_pending_packet_t *tmp_tail = NULL;
+
+    while (pending_packet) {
+        mdns_if_t tcpip_if = pending_packet->packet->tcpip_if;
+        mdns_ip_protocol_t ip_protocol = pending_packet->packet->ip_protocol;
+        mdns_pending_packet_t *next = pending_packet->next;
+        pending_packet->next = NULL;
+        if (mdns_is_netif_ready(tcpip_if, ip_protocol) && _mdns_server->interfaces[tcpip_if].pcbs[ip_protocol].state > PCB_INIT) {
+            _mdns_dispatch_tx_packet(pending_packet->packet);
+            _mdns_free_tx_packet(pending_packet->packet);
+            pending_packet->packet = NULL;
+            pending_packet->next = NULL;
+            free(pending_packet);
+        } else {
+            if (tmp_tail != NULL) {
+                tmp_tail->next = pending_packet;
+            } else {
+                tmp_head = pending_packet;
+            }
+            tmp_tail = pending_packet;
+        }
+        pending_packet = next;
+    }
+    _pending_list_head = tmp_head;
+    _pending_list_tail = tmp_tail;
 }
 
 /**
@@ -5341,6 +5398,7 @@ static void _mdns_service_task(void *pvParameters)
                 _mdns_execute_action(a);
                 MDNS_SERVICE_UNLOCK();
             }
+            _mdns_search_send_pending_pcb();
         } else {
             vTaskDelay(500 * portTICK_PERIOD_MS);
         }

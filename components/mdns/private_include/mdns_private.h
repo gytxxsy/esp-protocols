@@ -348,6 +348,11 @@ typedef struct mdns_tx_packet_s {
     uint16_t id;
 } mdns_tx_packet_t;
 
+typedef struct mdns_pending_packet_s {
+    mdns_tx_packet_t *packet;
+    struct mdns_pending_packet_s *next;
+} mdns_pending_packet_t;
+
 typedef struct {
     mdns_pcb_state_t state;
     mdns_srv_item_t **probe_services;
